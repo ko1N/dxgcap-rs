@@ -2,6 +2,9 @@
 
 #![cfg(windows)]
 
+pub mod pixfmt;
+pub use pixfmt::{BGRA8, RGBA8};
+
 extern crate winapi;
 extern crate wio;
 
@@ -21,15 +24,6 @@ use winapi::um::d3dcommon::*;
 use winapi::um::unknwnbase::*;
 use winapi::um::winuser::*;
 use wio::com::ComPtr;
-
-/// Color represented by additive channels: Blue (b), Green (g), Red (r), and Alpha (a).
-#[derive(Copy, Clone, Debug, PartialOrd, PartialEq, Eq, Ord)]
-pub struct BGRA8 {
-    pub b: u8,
-    pub g: u8,
-    pub r: u8,
-    pub a: u8,
-}
 
 /// Possible errors when capturing
 #[derive(Debug)]
@@ -365,7 +359,9 @@ impl DXGIManager {
         }
     }
 
-    fn capture_frame_t<T: Copy + Send + Sync + Sized>(&mut self) -> Result<(Vec<T>, (usize, usize)), CaptureError> {
+    fn capture_frame_t<T: Copy + Send + Sync + Sized>(
+        &mut self,
+    ) -> Result<(Vec<T>, (usize, usize)), CaptureError> {
         let frame_surface = match self.capture_frame_to_surface() {
             Ok(surface) => surface,
             Err(e) => return Err(e),
@@ -392,27 +388,27 @@ impl DXGIManager {
             ((right - left) as usize, (bottom - top) as usize)
         };
         let mut pixel_buf = Vec::with_capacity(byte_size(output_width * output_height));
-        
-        let scan_lines =
-            match output_desc.Rotation {
-                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => output_width,
-                _ => output_height,
-            };
+
+        let scan_lines = match output_desc.Rotation {
+            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => output_width,
+            _ => output_height,
+        };
 
         let mapped_pixels = unsafe {
-            slice::from_raw_parts(
-                mapped_surface.pBits as *const T,
-                byte_stride * scan_lines,
-            )
+            slice::from_raw_parts(mapped_surface.pBits as *const T, byte_stride * scan_lines)
         };
-        
+
         match output_desc.Rotation {
-            DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED =>
-                pixel_buf.extend_from_slice(mapped_pixels),
-            DXGI_MODE_ROTATION_ROTATE90 => {
-                unsafe {
-                    let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
-                    mapped_pixels.chunks(byte_stride).rev().enumerate().for_each(|(column, chunk)| {
+            DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED => {
+                pixel_buf.extend_from_slice(mapped_pixels)
+            }
+            DXGI_MODE_ROTATION_ROTATE90 => unsafe {
+                let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
+                mapped_pixels
+                    .chunks(byte_stride)
+                    .rev()
+                    .enumerate()
+                    .for_each(|(column, chunk)| {
                         let mut src = chunk.as_ptr() as *const BGRA8;
                         let mut dst = ptr.0 as *mut BGRA8;
                         dst = dst.add(column);
@@ -423,13 +419,15 @@ impl DXGIManager {
                             dst = dst.add(output_width);
                         }
                     });
-                    pixel_buf.set_len(pixel_buf.capacity());
-                }
-            }
-            DXGI_MODE_ROTATION_ROTATE180 => {
-                unsafe {
-                    let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
-                    mapped_pixels.chunks(byte_stride).rev().enumerate().for_each(|(scan_line, chunk)| {
+                pixel_buf.set_len(pixel_buf.capacity());
+            },
+            DXGI_MODE_ROTATION_ROTATE180 => unsafe {
+                let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
+                mapped_pixels
+                    .chunks(byte_stride)
+                    .rev()
+                    .enumerate()
+                    .for_each(|(scan_line, chunk)| {
                         let mut src = chunk.as_ptr() as *const BGRA8;
                         let mut dst = ptr.0 as *mut BGRA8;
                         dst = dst.add(scan_line * output_width);
@@ -441,13 +439,14 @@ impl DXGIManager {
                             dst = dst.add(1);
                         }
                     });
-                    pixel_buf.set_len(pixel_buf.capacity());
-                }
-            }
-            DXGI_MODE_ROTATION_ROTATE270 => {
-                unsafe {
-                    let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
-                    mapped_pixels.chunks(byte_stride).enumerate().for_each(|(column, chunk)| {
+                pixel_buf.set_len(pixel_buf.capacity());
+            },
+            DXGI_MODE_ROTATION_ROTATE270 => unsafe {
+                let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
+                mapped_pixels
+                    .chunks(byte_stride)
+                    .enumerate()
+                    .for_each(|(column, chunk)| {
                         let mut src = chunk.as_ptr() as *const BGRA8;
                         let mut dst = ptr.0 as *mut BGRA8;
                         dst = dst.add(column);
@@ -459,9 +458,8 @@ impl DXGIManager {
                             dst = dst.add(output_width);
                         }
                     });
-                    pixel_buf.set_len(pixel_buf.capacity());
-                }
-            }
+                pixel_buf.set_len(pixel_buf.capacity());
+            },
             n => unreachable!("Undefined DXGI_MODE_ROTATION: {}", n),
         }
         unsafe { frame_surface.Unmap() };
@@ -482,6 +480,28 @@ impl DXGIManager {
     /// On failure, return CaptureError.
     pub fn capture_frame_components(&mut self) -> Result<(Vec<u8>, (usize, usize)), CaptureError> {
         self.capture_frame_t()
+    }
+
+    // TODO: replace with gpu implementation
+    pub fn capture_frame_rgba(&mut self) -> Result<(Vec<RGBA8>, (usize, usize)), CaptureError> {
+        let (mut frame, size) = self.capture_frame()?;
+        for px in frame.iter_mut() {
+            ::std::mem::swap(&mut px.b, &mut px.r);
+        }
+        let frame = unsafe { ::std::mem::transmute(frame) };
+        Ok((frame, size))
+    }
+
+    // TODO: replace with gpu implementation
+    pub fn capture_frame_rgba_components(
+        &mut self,
+    ) -> Result<(Vec<u8>, (usize, usize)), CaptureError> {
+        let (mut frame, size) = self.capture_frame_components()?;
+
+        frame.chunks_exact_mut(4).for_each(|px| {
+            px.swap(0, 2);
+        });
+        Ok((frame, size))
     }
 }
 
