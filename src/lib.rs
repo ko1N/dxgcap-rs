@@ -10,6 +10,9 @@ extern crate wio;
 
 use std::mem::zeroed;
 use std::{mem, ptr, slice};
+
+use rayon::prelude::*;
+
 use winapi::shared::dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGISurface1,
     IID_IDXGIFactory1, DXGI_MAP_READ, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM,
@@ -71,6 +74,7 @@ fn d3d11_create_device(
             0,
             D3D11_SDK_VERSION,
             &mut d3d11_device,
+            #[allow(const_item_mutation)]
             &mut D3D_FEATURE_LEVEL_9_1,
             &mut device_context,
         );
@@ -133,6 +137,7 @@ fn get_capture_source(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn duplicate_outputs(
     mut device: ComPtr<ID3D11Device>,
     outputs: Vec<ComPtr<IDXGIOutput>>,
@@ -208,9 +213,9 @@ impl DuplicatedOutput {
         texture_desc.MiscFlags = 0;
         let readable_texture = unsafe {
             let mut readable_texture = ptr::null_mut();
-            let hr =
-                self.device
-                    .CreateTexture2D(&mut texture_desc, ptr::null(), &mut readable_texture);
+            let hr = self
+                .device
+                .CreateTexture2D(&texture_desc, ptr::null(), &mut readable_texture);
             if hr_failed(hr) {
                 return Err(hr);
             }
@@ -250,7 +255,7 @@ impl DXGIManager {
         let mut manager = DXGIManager {
             duplicated_output: None,
             capture_source_index: 0,
-            timeout_ms: timeout_ms,
+            timeout_ms,
         };
 
         match manager.acquire_output_duplication() {
@@ -286,7 +291,7 @@ impl DXGIManager {
     }
 
     /// Duplicate and acquire output selected by `capture_source_index`
-    pub fn acquire_output_duplication(&mut self) -> Result<(), ()> {
+    pub fn acquire_output_duplication(&mut self) -> Result<(), &'static str> {
         self.duplicated_output = None;
         let factory = create_dxgi_factory_1();
         for (outputs, adapter) in (0..)
@@ -302,31 +307,31 @@ impl DXGIManager {
             })
             .take_while(Option::is_some)
             .map(Option::unwrap)
-            .map(|mut adapter| (get_adapter_outputs(&mut adapter), adapter))
+            .map(|adapter| (get_adapter_outputs(&adapter), adapter))
             .filter(|&(ref outs, _)| !outs.is_empty())
         {
             // Creating device for each adapter that has the output
             let (d3d11_device, device_context) = d3d11_create_device(adapter.up().as_raw());
-            let (d3d11_device, output_duplications) =
-                duplicate_outputs(d3d11_device, outputs).map_err(|_| ())?;
+            let (d3d11_device, output_duplications) = duplicate_outputs(d3d11_device, outputs)
+                .map_err(|_| "Unable to duplicate output")?;
             if let Some((output_duplication, output)) =
                 get_capture_source(output_duplications, self.capture_source_index)
             {
                 self.duplicated_output = Some(DuplicatedOutput {
                     device: d3d11_device,
-                    device_context: device_context,
-                    output: output,
-                    output_duplication: output_duplication,
+                    device_context,
+                    output,
+                    output_duplication,
                 });
                 return Ok(());
             }
         }
-        Err(())
+        Err("No output could be acquired")
     }
 
     fn capture_frame_to_surface(&mut self) -> Result<ComPtr<IDXGISurface1>, CaptureError> {
-        if let None = self.duplicated_output {
-            if let Ok(_) = self.acquire_output_duplication() {
+        if self.duplicated_output.is_none() {
+            if self.acquire_output_duplication().is_ok() {
                 return Err(CaptureError::Fail("No valid duplicated output"));
             } else {
                 return Err(CaptureError::RefreshFailure);
@@ -341,7 +346,7 @@ impl DXGIManager {
         {
             Ok(surface) => Ok(surface),
             Err(DXGI_ERROR_ACCESS_LOST) => {
-                if let Ok(_) = self.acquire_output_duplication() {
+                if self.acquire_output_duplication().is_ok() {
                     Err(CaptureError::AccessLost)
                 } else {
                     Err(CaptureError::RefreshFailure)
@@ -350,7 +355,7 @@ impl DXGIManager {
             Err(E_ACCESSDENIED) => Err(CaptureError::AccessDenied),
             Err(DXGI_ERROR_WAIT_TIMEOUT) => Err(CaptureError::Timeout),
             Err(_) => {
-                if let Ok(_) = self.acquire_output_duplication() {
+                if self.acquire_output_duplication().is_ok() {
                     Err(CaptureError::Fail("Failure when acquiring frame"))
                 } else {
                     Err(CaptureError::RefreshFailure)
@@ -387,7 +392,6 @@ impl DXGIManager {
             } = output_desc.DesktopCoordinates;
             ((right - left) as usize, (bottom - top) as usize)
         };
-        let mut pixel_buf = Vec::with_capacity(byte_size(output_width * output_height));
 
         let scan_lines = match output_desc.Rotation {
             DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => output_width,
@@ -398,14 +402,13 @@ impl DXGIManager {
             slice::from_raw_parts(mapped_surface.pBits as *const T, byte_stride * scan_lines)
         };
 
-        match output_desc.Rotation {
-            DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED => {
-                pixel_buf.extend_from_slice(mapped_pixels)
-            }
+        let pixel_buf = match output_desc.Rotation {
+            DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED => mapped_pixels.to_vec(),
             DXGI_MODE_ROTATION_ROTATE90 => unsafe {
+                let mut pixel_buf = Vec::with_capacity(byte_size(output_width * output_height));
                 let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
                 mapped_pixels
-                    .chunks(byte_stride)
+                    .par_chunks(byte_stride)
                     .rev()
                     .enumerate()
                     .for_each(|(column, chunk)| {
@@ -420,11 +423,13 @@ impl DXGIManager {
                         }
                     });
                 pixel_buf.set_len(pixel_buf.capacity());
+                pixel_buf
             },
             DXGI_MODE_ROTATION_ROTATE180 => unsafe {
+                let mut pixel_buf = Vec::with_capacity(byte_size(output_width * output_height));
                 let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
                 mapped_pixels
-                    .chunks(byte_stride)
+                    .par_chunks(byte_stride)
                     .rev()
                     .enumerate()
                     .for_each(|(scan_line, chunk)| {
@@ -440,11 +445,13 @@ impl DXGIManager {
                         }
                     });
                 pixel_buf.set_len(pixel_buf.capacity());
+                pixel_buf
             },
             DXGI_MODE_ROTATION_ROTATE270 => unsafe {
+                let mut pixel_buf = Vec::with_capacity(byte_size(output_width * output_height));
                 let ptr = SharedPtr(pixel_buf.as_ptr() as *const BGRA8);
                 mapped_pixels
-                    .chunks(byte_stride)
+                    .par_chunks(byte_stride)
                     .enumerate()
                     .for_each(|(column, chunk)| {
                         let mut src = chunk.as_ptr() as *const BGRA8;
@@ -459,9 +466,10 @@ impl DXGIManager {
                         }
                     });
                 pixel_buf.set_len(pixel_buf.capacity());
+                pixel_buf
             },
             n => unreachable!("Undefined DXGI_MODE_ROTATION: {}", n),
-        }
+        };
         unsafe { frame_surface.Unmap() };
         Ok((pixel_buf, (output_width, output_height)))
     }
@@ -485,9 +493,9 @@ impl DXGIManager {
     // TODO: replace with gpu implementation
     pub fn capture_frame_rgba(&mut self) -> Result<(Vec<RGBA8>, (usize, usize)), CaptureError> {
         let (mut frame, size) = self.capture_frame()?;
-        for px in frame.iter_mut() {
+        frame.par_iter_mut().for_each(|px| {
             ::std::mem::swap(&mut px.b, &mut px.r);
-        }
+        });
         let frame = unsafe { ::std::mem::transmute(frame) };
         Ok((frame, size))
     }
@@ -498,7 +506,7 @@ impl DXGIManager {
     ) -> Result<(Vec<u8>, (usize, usize)), CaptureError> {
         let (mut frame, size) = self.capture_frame_components()?;
 
-        frame.chunks_exact_mut(4).for_each(|px| {
+        frame.par_chunks_exact_mut(4).for_each(|px| {
             px.swap(0, 2);
         });
         Ok((frame, size))

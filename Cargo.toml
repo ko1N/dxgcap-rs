@@ -13,3 +13,6 @@ edition = "2018"
 [dependencies]
 winapi = { version = "0.3.8", features = ["d3d11", "d3dcommon", "dxgi", "dxgi1_2", "dxgitype", "ntdef", "unknwnbase", "windef", "winerror", "winuser"] }
 wio = "0.2.2"
+
+# TODO: optional
+rayon = "1.6"
