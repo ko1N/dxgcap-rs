@@ -15,9 +15,9 @@ jobs:
         toolchain: 1.65.0
         override: true
     - name: build
-      run: cargo build --workspace --all-features --verbose
+      run: cargo build --all-features --verbose
     - name: build examples
-      run: cargo build --workspace --all-features --examples --verbose
+      run: cargo build --all-features --examples --verbose
 
   test:
     runs-on: windows-latest
@@ -28,7 +28,7 @@ jobs:
         toolchain: 1.65.0
         override: true
     - name: run tests
-      run: cargo test --workspace --all-features --verbose
+      run: cargo test --all-features --verbose
 
   lint:
     runs-on: windows-latest
@@ -42,4 +42,4 @@ jobs:
       - uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-targets --all-features --workspace -- -D clippy::all
+          args: --all-targets --all-features -- -D clippy::all
