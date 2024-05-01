@@ -15,7 +15,8 @@ use rayon::prelude::*;
 
 use winapi::shared::dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGISurface1,
-    IID_IDXGIFactory1, DXGI_MAP_READ, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM,
+    IID_IDXGIFactory1, DXGI_MAPPED_RECT, DXGI_MAP_READ, DXGI_OUTPUT_DESC,
+    DXGI_RESOURCE_PRIORITY_MAXIMUM,
 };
 use winapi::shared::dxgi1_2::{IDXGIOutput1, IDXGIOutputDuplication};
 use winapi::shared::dxgitype::*;
@@ -241,6 +242,92 @@ pub struct DXGIManager {
     duplicated_output: Option<DuplicatedOutput>,
     capture_source_index: usize,
     timeout_ms: u32,
+    frame_number: u64,
+}
+
+pub struct DXGIFrame<T>
+where
+    T: 'static,
+{
+    frame_number: u64,
+    frame_surface: ComPtr<IDXGISurface1>,
+    mapped_pixels: &'static [T],
+    width: usize,
+    height: usize,
+}
+
+unsafe impl<T> Send for DXGIFrame<T> {}
+unsafe impl<T> Sync for DXGIFrame<T> {}
+
+impl<T> DXGIFrame<T> {
+    pub fn frame_number(&self) -> u64 {
+        self.frame_number
+    }
+
+    pub fn pixels<'a>(&'a self) -> &'a [T] {
+        &self.mapped_pixels
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn new(
+        frame_surface: ComPtr<IDXGISurface1>,
+        frame_number: u64,
+        output_desc: &DXGI_OUTPUT_DESC,
+    ) -> Result<Self, CaptureError> {
+        // TODO: map and stuff
+
+        let mapped_surface = unsafe {
+            let mut mapped_surface = zeroed();
+            if hr_failed(frame_surface.Map(&mut mapped_surface, DXGI_MAP_READ)) {
+                frame_surface.Release();
+                return Err(CaptureError::Fail("Failed to map surface"));
+            }
+            mapped_surface
+        };
+
+        let byte_size = |x| x * mem::size_of::<BGRA8>() / mem::size_of::<T>();
+        let stride = mapped_surface.Pitch as usize / mem::size_of::<BGRA8>();
+        let byte_stride = byte_size(stride);
+        let (output_width, output_height) = {
+            let RECT {
+                left,
+                top,
+                right,
+                bottom,
+            } = output_desc.DesktopCoordinates;
+            ((right - left) as usize, (bottom - top) as usize)
+        };
+
+        let scan_lines = match output_desc.Rotation {
+            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => output_width,
+            _ => output_height,
+        };
+
+        let mapped_pixels = unsafe {
+            slice::from_raw_parts(mapped_surface.pBits as *const T, byte_stride * scan_lines)
+        };
+
+        Ok(Self {
+            frame_number,
+            frame_surface,
+            mapped_pixels,
+            width: output_width,
+            height: output_height,
+        })
+    }
+}
+
+impl<T> Drop for DXGIFrame<T> {
+    fn drop(&mut self) {
+        unsafe { self.frame_surface.Unmap() };
+    }
 }
 
 struct SharedPtr<T>(*const T);
@@ -256,6 +343,7 @@ impl DXGIManager {
             duplicated_output: None,
             capture_source_index: 0,
             timeout_ms,
+            frame_number: 0,
         };
 
         match manager.acquire_output_duplication() {
@@ -362,6 +450,22 @@ impl DXGIManager {
                 }
             }
         }
+    }
+
+    pub fn capture_frame_new<T: Copy + Send + Sync + Sized>(
+        &mut self,
+    ) -> Result<DXGIFrame<T>, CaptureError> {
+        let frame_surface = match self.capture_frame_to_surface() {
+            Ok(surface) => surface,
+            Err(e) => return Err(e),
+        };
+
+        let output_desc = self.duplicated_output.as_mut().unwrap().get_desc();
+        let frame_number = self.frame_number;
+        self.frame_number += 1;
+
+        let frame = DXGIFrame::new(frame_surface, frame_number, &output_desc)?;
+        Ok(frame)
     }
 
     fn capture_frame_t<T: Copy + Send + Sync + Sized>(
